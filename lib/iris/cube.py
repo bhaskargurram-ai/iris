@@ -442,6 +442,9 @@ class CubeList(list):
         """
         # Register each of our cubes with its appropriate ProtoCube.
         proto_cubes_by_name = {}
+        # Share array hashes between the ProtoCubes, so that each coordinate,
+        # cell measure and ancillary variable array is hashed only once.
+        hashes = iris._merge._ArrayHashes()
         for c in self:
             name = c.standard_name
             proto_cubes = proto_cubes_by_name.setdefault(name, [])
@@ -453,7 +456,7 @@ class CubeList(list):
                     break
 
             if proto_cube is None:
-                proto_cube = iris._merge.ProtoCube(c)
+                proto_cube = iris._merge.ProtoCube(c, hashes=hashes)
                 proto_cubes.append(proto_cube)
 
         # Emulate Python 2 behaviour.

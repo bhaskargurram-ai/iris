@@ -7,13 +7,14 @@
 from collections.abc import Iterable
 import itertools
 
+import dask.array as da
 import numpy as np
 import numpy.ma as ma
 import pytest
 
 import iris
 from iris._lazy_data import as_lazy_data
-from iris.coords import AuxCoord, DimCoord
+from iris.coords import AncillaryVariable, AuxCoord, CellMeasure, DimCoord
 import iris.cube
 from iris.cube import CubeAttrsDict
 import iris.exceptions
@@ -453,3 +454,150 @@ class TestCubeMerge_masked_scalar:
         assert np.ma.isMaskedArray(c.points)
         assert all([c.points.mask[i] == i % 2 for i in range(n)])
         assert c.points.dtype.type is dtype
+
+
+class _CountingArray:
+    """An array-like which counts how many times its values are fetched."""
+
+    _ids = itertools.count()
+
+    def __init__(self, array):
+        # A unique id, so that each instance gets a different Dask name.
+        self.id = next(self._ids)
+        self._array = np.asanyarray(array)
+        self.shape = self._array.shape
+        self.dtype = self._array.dtype
+        self.ndim = self._array.ndim
+        self.count = 0
+
+    def __getitem__(self, keys):
+        self.count += 1
+        return self._array[keys]
+
+
+class TestMergeComponentValues:
+    """Comparison of vector coordinate, cell measure and ancillary variable values."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        self.sources = []
+
+    def _lazy(self, values):
+        source = _CountingArray(values)
+        self.sources.append(source)
+        meta = np.ndarray((0,) * source.ndim, dtype=source.dtype)
+        return as_lazy_data(source, meta=meta)
+
+    def _make_cube(self, time, level=0, reference=None, name="air_temperature"):
+        if reference is None:
+            reference = self._lazy(np.arange(6.0).reshape(2, 3))
+        cube = iris.cube.Cube(np.zeros((2, 3)), standard_name=name, units="K")
+        cube.add_dim_coord(DimCoord([0, 1], long_name="y"), 0)
+        cube.add_dim_coord(DimCoord([0, 1, 2], long_name="x"), 1)
+        cube.add_aux_coord(DimCoord(time, long_name="time"))
+        cube.add_aux_coord(DimCoord(level, long_name="level"))
+        cube.add_aux_coord(AuxCoord(reference, long_name="reference"), (0, 1))
+        cube.add_cell_measure(
+            CellMeasure(self._lazy(np.ones((2, 3))), long_name="area"), (0, 1)
+        )
+        cube.add_ancillary_variable(
+            AncillaryVariable(
+                self._lazy(np.zeros((2, 3), dtype=np.int8)), long_name="flags"
+            ),
+            (0, 1),
+        )
+        return cube
+
+    def _assert_lazy(self, cube):
+        assert cube.coord("reference").has_lazy_points()
+        assert cube.cell_measure("area").has_lazy_data()
+        assert cube.ancillary_variable("flags").has_lazy_data()
+
+    def test_merge_cube_fetches_once(self):
+        cubes = iris.cube.CubeList([self._make_cube(time) for time in range(4)])
+        result = cubes.merge_cube()
+        assert result.shape == (4, 2, 3)
+        assert [source.count for source in self.sources] == [1] * 12
+        self._assert_lazy(result)
+
+    def test_merge_fetches_once(self):
+        # The reference varies with time, so each time is a separate ProtoCube
+        # and every cube is compared with several of them.
+        cubes = iris.cube.CubeList()
+        for time in range(3):
+            for level in range(4):
+                reference = self._lazy(np.arange(6.0).reshape(2, 3) + time)
+                cubes.append(self._make_cube(time, level, reference))
+        result = cubes.merge()
+        assert len(result) == 3
+        assert all(cube.shape == (4, 2, 3) for cube in result)
+        assert [source.count for source in self.sources] == [1] * 36
+        for cube in result:
+            self._assert_lazy(cube)
+
+    def test_no_fetch_when_not_compared(self):
+        cubes = iris.cube.CubeList(
+            [self._make_cube(0), self._make_cube(1, name="air_pressure")]
+        )
+        result = cubes.merge()
+        assert len(result) == 2
+        assert [source.count for source in self.sources] == [0] * 6
+
+    @pytest.mark.parametrize(
+        ("reference1", "reference2", "n_cubes"),
+        [
+            ([1.0, 2.0], [1.0, 2.0], 1),
+            ([1.0, 2.0], [1.0, 3.0], 2),
+            ([1.0, -0.0], [1.0, 0.0], 1),
+            ([1.0, np.nan], [1.0, -np.nan], 1),
+            ([1, 2], [1.0, 2.0], 1),
+            (
+                np.ma.masked_array([1.0, 2.0], mask=[0, 1]),
+                np.ma.masked_array([1.0, 3.0], mask=[0, 1]),
+                1,
+            ),
+            (
+                np.ma.masked_array([1.0, 2.0], mask=[0, 1]),
+                np.ma.masked_array([1.0, 2.0], mask=[0, 0]),
+                2,
+            ),
+            (np.array(["a", "b"], dtype="U1"), np.array(["a", "b"], dtype="U3"), 1),
+        ],
+        ids=[
+            "same",
+            "different",
+            "negative_zero",
+            "nan",
+            "int_and_float",
+            "masked",
+            "mask_differs",
+            "string_widths",
+        ],
+    )
+    @pytest.mark.parametrize("lazy", ["real", "lazy", "lazy_chunked", "mixed"])
+    def test_merge_values(self, reference1, reference2, n_cubes, lazy):
+        reference1 = np.ma.masked_array(reference1).reshape(2, 1).repeat(3, 1)
+        reference2 = np.ma.masked_array(reference2).reshape(2, 1).repeat(3, 1)
+        if lazy in ("lazy", "mixed"):
+            reference1 = as_lazy_data(reference1)
+        if lazy == "lazy":
+            reference2 = as_lazy_data(reference2)
+        if lazy == "lazy_chunked":
+            reference1 = da.from_array(reference1, chunks=1, asarray=False)
+            reference2 = da.from_array(reference2, chunks=(2, 1), asarray=False)
+        cubes = iris.cube.CubeList(
+            [
+                self._make_cube(0, reference=reference1),
+                self._make_cube(1, reference=reference2),
+            ]
+        )
+        assert len(cubes.merge()) == n_cubes
+
+    def test_merge_cube_error(self):
+        reference = self._lazy(np.arange(6.0).reshape(2, 3) + 1)
+        cubes = iris.cube.CubeList(
+            [self._make_cube(0), self._make_cube(1, reference=reference)]
+        )
+        msg = "Coordinates in cube.aux_coords \\(non-scalar\\) differ: reference."
+        with pytest.raises(iris.exceptions.MergeError, match=msg):
+            cubes.merge_cube()

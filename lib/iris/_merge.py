@@ -10,12 +10,15 @@ Typically the cube merge process is handled by
 """
 
 from collections import OrderedDict, namedtuple
+from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
+import dask
 import dask.array as da
 import numpy as np
 
+from iris._hashing import _hash_array
 from iris._lazy_data import (
     as_concrete_data,
     as_lazy_data,
@@ -27,12 +30,192 @@ from iris.common._split_attribute_dicts import (
     _convert_splitattrs_to_pairedkeys_dict as convert_splitattrs_to_pairedkeys_dict,
 )
 import iris.coords
+from iris.coords import AncillaryVariable, AuxCoord, CellMeasure, DimCoord
 import iris.cube
 import iris.exceptions
 import iris.util
 
 if TYPE_CHECKING:
     from iris.cube import CubeList
+
+
+#
+# Comparison of array values by hash.
+#
+# Classes whose equality depends only on the metadata, the presence of bounds
+# and the array values (plus ``circular`` for DimCoord).
+_HASHABLE_TYPES = (AncillaryVariable, AuxCoord, CellMeasure, DimCoord)
+
+
+def _value_pairs(
+    component1: iris.coords._DimensionalMetadata,
+    component2: iris.coords._DimensionalMetadata,
+) -> list[tuple[np.ndarray | da.Array, np.ndarray | da.Array]] | None:
+    """Return the pairs of arrays which decide whether two components are equal.
+
+    Parameters
+    ----------
+    component1, component2 :
+        The coordinates, cell measures or ancillary variables to compare.
+
+    Returns
+    -------
+    list of tuple or None
+        The pairs of points (or data) and bounds arrays, if the components
+        are equal when these arrays are equal. None if the components differ
+        in anything else, or if their equality depends on more than this.
+
+    """
+    if (
+        type(component1) is not type(component2)
+        or type(component1) not in _HASHABLE_TYPES
+        or component1.metadata != component2.metadata
+        or component1.has_bounds() is not component2.has_bounds()
+    ):
+        return None
+    pairs = [(component1._core_values(), component2._core_values())]
+    if isinstance(component1, iris.coords.Coord) and isinstance(
+        component2, iris.coords.Coord
+    ):
+        if (
+            isinstance(component1, DimCoord)
+            and isinstance(component2, DimCoord)
+            and component1.circular != component2.circular
+        ):
+            return None
+        if component1.has_bounds():
+            pairs.append((component1.core_bounds(), component2.core_bounds()))
+    return pairs
+
+
+class _ArrayHashes:
+    """Hashes of the lazy array values compared during a merge.
+
+    Each array is hashed at most once, so comparing it again (e.g. with the
+    source-cube of another :class:`ProtoCube`) does not fetch its data again.
+
+    """
+
+    def __init__(self) -> None:
+        # Hash values by array id.  The arrays are kept so the ids stay valid.
+        self._hashes: dict[int, tuple[np.ndarray | da.Array, np.int64]] = {}
+
+    @staticmethod
+    def _comparable(
+        array1: np.ndarray | da.Array, array2: np.ndarray | da.Array
+    ) -> bool:
+        # Only lazy arrays are worth hashing: real ones are quicker to compare
+        # directly.  Hashes depend on the dtype and the chunks.  Other kinds of
+        # dtype can have values that compare equal but have different bytes, or
+        # the reverse (e.g. objects, NaT, complex NaNs).
+        return (
+            array1 is not array2
+            and is_lazy_data(array1)
+            and is_lazy_data(array2)
+            and array1.shape == array2.shape
+            and array1.dtype == array2.dtype
+            and array1.dtype.kind in "biufSU"
+            and array1.chunks == array2.chunks
+        )
+
+    def compute(
+        self,
+        array_pairs: Iterable[tuple[np.ndarray | da.Array, np.ndarray | da.Array]],
+    ) -> None:
+        """Hash the arrays of pairs which can be compared by hash, all in one go.
+
+        Parameters
+        ----------
+        array_pairs :
+            The pairs of arrays that will be compared.
+
+        """
+        arrays = {
+            id(array): array
+            for pair in array_pairs
+            if self._comparable(*pair)
+            for array in pair
+            if id(array) not in self._hashes
+        }
+        if arrays:
+            (values,) = dask.compute(
+                {key: _hash_array(array) for key, array in arrays.items()}
+            )
+            for key, array in arrays.items():
+                self._hashes[key] = (array, values[key])
+
+    def compute_for(
+        self,
+        *pairs: tuple[Sequence[tuple], Sequence[tuple]],
+    ) -> None:
+        """Hash the arrays needed to compare lists of components, all in one go.
+
+        Parameters
+        ----------
+        *pairs :
+            Pairs of lists of ``(component, dims)`` items that will be compared.
+
+        """
+        array_pairs = []
+        for items1, items2 in pairs:
+            if len(items1) == len(items2):
+                for (component1, dims1), (component2, dims2) in zip(items1, items2):
+                    if component1 is not component2 and dims1 == dims2:
+                        array_pairs.extend(_value_pairs(component1, component2) or [])
+        self.compute(array_pairs)
+
+    def array_equal(
+        self, array1: np.ndarray | da.Array, array2: np.ndarray | da.Array
+    ) -> bool:
+        """Compare arrays like :func:`iris.util.array_equal` with ``withnans=True``.
+
+        The arrays are compared by hash where possible.
+
+        """
+        if not self._comparable(array1, array2):
+            return iris.util.array_equal(array1, array2, withnans=True)
+        self.compute([(array1, array2)])
+        return bool(self._hashes[id(array1)][1] == self._hashes[id(array2)][1])
+
+
+class _HashedComponent:
+    """A coordinate, cell measure or ancillary variable, compared by hash.
+
+    Equality is the same as for the wrapped components, but array values are
+    compared using :class:`_ArrayHashes` where possible.
+
+    """
+
+    __slots__ = ("component", "hashes")
+
+    def __init__(
+        self, component: iris.coords._DimensionalMetadata, hashes: _ArrayHashes
+    ) -> None:
+        self.component = component
+        self.hashes = hashes
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _HashedComponent):
+            return NotImplemented
+        if self.component is other.component:
+            return True
+        pairs = _value_pairs(self.component, other.component)
+        if pairs is None:
+            return self.component == other.component
+        return all(self.hashes.array_equal(*pair) for pair in pairs)
+
+    def name(self) -> str:
+        return self.component.name()
+
+
+def _hashed(
+    components_and_dims: Iterable[tuple], hashes: _ArrayHashes
+) -> list[tuple[_HashedComponent, tuple[int, ...]]]:
+    """Wrap the components of ``(component, dims)`` items, to compare by hash."""
+    return [
+        (_HashedComponent(component, hashes), dims)
+        for component, dims in components_and_dims
+    ]
 
 
 #
@@ -212,7 +395,12 @@ class _CoordPayload(namedtuple("CoordPayload", ["scalar", "vector", "factory_def
                     " (i.e. DimCoord vs AuxCoord).".format(coord_group)
                 )
 
-    def match_signature(self, signature, error_on_mismatch):
+    def match_signature(
+        self,
+        signature: "_CoordSignature",
+        error_on_mismatch: bool,
+        hashes: _ArrayHashes | None = None,
+    ) -> bool:
         """Check if _CoordPayload matches the corresponding aspects of a _CoordSignature.
 
         Return whether this _CoordPayload matches the corresponding
@@ -224,6 +412,8 @@ class _CoordPayload(namedtuple("CoordPayload", ["scalar", "vector", "factory_def
             The _CoordSignature to compare against.
         error_on_mismatch : bool
             If True, raise an Exception with detailed explanation.
+        hashes : _ArrayHashes, optional
+            Hashes for comparing the vector coordinate values.
 
         Returns
         -------
@@ -248,7 +438,14 @@ class _CoordPayload(namedtuple("CoordPayload", ["scalar", "vector", "factory_def
                     )
                 )
 
-        msgs = []
+        if hashes is None:
+            hashes = _ArrayHashes()
+        hashes.compute_for(
+            (self.vector.dim_coords_and_dims, signature.vector_dim_coords_and_dims),
+            (self.vector.aux_coords_and_dims, signature.vector_aux_coords_and_dims),
+        )
+
+        msgs: list[str] = []
         self._coords_msgs(
             msgs,
             "cube.aux_coords (scalar)",
@@ -257,14 +454,18 @@ class _CoordPayload(namedtuple("CoordPayload", ["scalar", "vector", "factory_def
         )
 
         coord_group = "cube.dim_coords"
-        self_coords, self_dims = unzip(self.vector.dim_coords_and_dims)
-        other_coords, other_dims = unzip(signature.vector_dim_coords_and_dims)
+        self_coords, self_dims = unzip(_hashed(self.vector.dim_coords_and_dims, hashes))
+        other_coords, other_dims = unzip(
+            _hashed(signature.vector_dim_coords_and_dims, hashes)
+        )
         self._coords_msgs(msgs, coord_group, self_coords, other_coords)
         dims_msgs(msgs, coord_group, self_dims, other_dims)
 
         coord_group = "cube.aux_coords (non-scalar)"
-        self_coords, self_dims = unzip(self.vector.aux_coords_and_dims)
-        other_coords, other_dims = unzip(signature.vector_aux_coords_and_dims)
+        self_coords, self_dims = unzip(_hashed(self.vector.aux_coords_and_dims, hashes))
+        other_coords, other_dims = unzip(
+            _hashed(signature.vector_aux_coords_and_dims, hashes)
+        )
         self._coords_msgs(msgs, coord_group, self_coords, other_coords)
         dims_msgs(msgs, coord_group, self_dims, other_dims)
 
@@ -405,7 +606,12 @@ class _CubeSignature(
             msgs.append("cube.cell_methods differ")
         return msgs
 
-    def match(self, other, error_on_mismatch):
+    def match(
+        self,
+        other: "_CubeSignature",
+        error_on_mismatch: bool,
+        hashes: _ArrayHashes | None = None,
+    ) -> bool:
         """Return whether this _CubeSignature equals another.
 
         This is the first step to determine if two "cubes" (either a
@@ -424,6 +630,8 @@ class _CubeSignature(
         error_on_mismatch : bool
             If True, raise a :class:`~iris.exceptions.MergeException`
             with a detailed explanation if the two do not match.
+        hashes : _ArrayHashes, optional
+            Hashes for comparing the cell measure and ancillary variable values.
 
         Returns
         -------
@@ -447,9 +655,19 @@ class _CubeSignature(
         # Both cell_measures_and_dims and ancillary_variables_and_dims are
         # ordered by the same method, it is therefore not possible for a
         # mismatch to be caused by a difference in order.
-        if self.cell_measures_and_dims != other.cell_measures_and_dims:
+        if hashes is None:
+            hashes = _ArrayHashes()
+        hashes.compute_for(
+            (self.cell_measures_and_dims, other.cell_measures_and_dims),
+            (self.ancillary_variables_and_dims, other.ancillary_variables_and_dims),
+        )
+        if _hashed(self.cell_measures_and_dims, hashes) != _hashed(
+            other.cell_measures_and_dims, hashes
+        ):
             msgs.append("cube.cell_measures differ")
-        if self.ancillary_variables_and_dims != other.ancillary_variables_and_dims:
+        if _hashed(self.ancillary_variables_and_dims, hashes) != _hashed(
+            other.ancillary_variables_and_dims, hashes
+        ):
             msgs.append("cube.ancillary_variables differ")
 
         match = not bool(msgs)
@@ -1113,11 +1331,19 @@ def derive_space(groups, relation_matrix, positions, function_matrix=None):
 class ProtoCube:
     """Framework for merging source-cubes into one or more higher dimensional cubes."""
 
-    def __init__(self, cube):
+    def __init__(self, cube, hashes=None):
         """Create a new ProtoCube from the given cube.
 
         Create a new ProtoCube from the given cube and record the cube as a
         source-cube.
+
+        Parameters
+        ----------
+        cube :
+            The first source-cube.
+        hashes : _ArrayHashes, optional
+            Hashes of array values, which can be shared by the ProtoCubes of
+            one merge so that each array is only hashed once.
 
         """
         # Default hint ordering for candidate dimension coordinates.
@@ -1130,6 +1356,10 @@ class ProtoCube:
 
         # The proto-cube source.
         self._source = cube
+
+        # Hashes for comparing coordinate, cell measure and ancillary variable
+        # values with those of candidate source-cubes.
+        self._hashes = _ArrayHashes() if hashes is None else hashes
 
         # The cube signature is metadata that defines this ProtoCube.
         self._cube_signature = self._build_signature(cube)
@@ -1332,11 +1562,11 @@ class ProtoCube:
         """
         cube_signature = self._cube_signature
         other = self._build_signature(cube)
-        match = cube_signature.match(other, error_on_mismatch)
+        match = cube_signature.match(other, error_on_mismatch, self._hashes)
         if match:
             coord_payload = self._extract_coord_payload(cube)
             match = coord_payload.match_signature(
-                self._coord_signature, error_on_mismatch
+                self._coord_signature, error_on_mismatch, self._hashes
             )
         if match:
             # Register the cube as a source-cube for this ProtoCube.

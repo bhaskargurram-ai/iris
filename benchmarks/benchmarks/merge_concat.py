@@ -6,9 +6,11 @@
 
 import warnings
 
+import dask.array as da
 import numpy as np
 
-from iris.cube import CubeList
+from iris.coords import AncillaryVariable, AuxCoord, CellMeasure, DimCoord
+from iris.cube import Cube, CubeList
 from iris.warnings import IrisVagueMetadataWarning
 
 from .generate_data.stock import realistic_4d_w_everything
@@ -38,6 +40,52 @@ class Merge:
 
     def tracemalloc_merge(self):
         _ = self.cube_list.merge_cube()
+
+    tracemalloc_merge.number = 3  # type: ignore[attr-defined]
+
+
+class MergeLazyComponents:
+    """Merge cubes with large lazy aux coords, cell measures and ancillary variables.
+
+    The cubes have one of ``n_references`` different reference coordinates (like
+    a time-varying surface pressure), so they merge into that many cubes, and
+    each cube is compared with several ProtoCubes.
+    """
+
+    cube_list: CubeList
+
+    params = [[1, 6]]
+    param_names = ["n_references"]
+
+    def setup(self, n_references: int):
+        n_cubes = 24
+        shape = (400, 500)
+
+        def lazy(array):
+            # A unique name for each, as if loaded from separate files.
+            return da.from_array(array, chunks=(200, 250), name=False)
+
+        references = [np.full(shape, float(i)) for i in range(n_references)]
+        area = np.ones(shape)
+        flags = np.zeros(shape, dtype=np.int8)
+
+        self.cube_list = CubeList()
+        for i in range(n_cubes):
+            cube = Cube(da.zeros(shape), long_name="foo")
+            cube.add_aux_coord(DimCoord(i, long_name="level"))
+            reference = lazy(references[i % n_references])
+            cube.add_aux_coord(AuxCoord(reference, long_name="reference"), (0, 1))
+            cube.add_cell_measure(CellMeasure(lazy(area), long_name="area"), (0, 1))
+            cube.add_ancillary_variable(
+                AncillaryVariable(lazy(flags), long_name="flags"), (0, 1)
+            )
+            self.cube_list.append(cube)
+
+    def time_merge(self, _):
+        _ = self.cube_list.merge()
+
+    def tracemalloc_merge(self, _):
+        _ = self.cube_list.merge()
 
     tracemalloc_merge.number = 3  # type: ignore[attr-defined]
 
